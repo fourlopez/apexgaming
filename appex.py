@@ -30,10 +30,6 @@ DATA_FOLDER = Path("data")
 
 DATABASE_PATH = DATA_FOLDER / "apexsample.db"
 
-
-# Make sure the folder exists.
-# This also prevents errors if the repository has
-# no data folder yet.
 DATA_FOLDER.mkdir(
     parents=True,
     exist_ok=True
@@ -77,13 +73,6 @@ MONTHS = [
 # =========================================================
 
 def get_dataset_name(file_path):
-    """
-    The CSV filename becomes the SQLite table name.
-
-    Example:
-        apexsample.csv
-        -> apexsample
-    """
 
     if hasattr(file_path, "name"):
         return Path(file_path.name).stem
@@ -92,9 +81,6 @@ def get_dataset_name(file_path):
 
 
 def table_exists(table_name):
-    """
-    Check whether a SQLite table exists.
-    """
 
     result = conn.execute(
         """
@@ -110,9 +96,6 @@ def table_exists(table_name):
 
 
 def get_table_columns(table_name):
-    """
-    Return the columns from an existing SQLite table.
-    """
 
     cursor = conn.execute(
         f'PRAGMA table_info("{table_name}")'
@@ -125,11 +108,6 @@ def get_table_columns(table_name):
 
 
 def get_sqlite_tables():
-    """
-    Return production SQLite tables only.
-
-    Pending tables are excluded.
-    """
 
     tables = pd.read_sql_query(
         """
@@ -146,12 +124,6 @@ def get_sqlite_tables():
 
 
 def delete_sqlite_tables(table_names):
-    """
-    Permanently delete multiple production SQLite tables.
-
-    Pending tables are not directly selected because
-    get_sqlite_tables() excludes them.
-    """
 
     for table_name in table_names:
 
@@ -159,7 +131,6 @@ def delete_sqlite_tables(table_names):
             f'DROP TABLE IF EXISTS "{table_name}"'
         )
 
-        # Also remove its pending table if it exists.
         pending_table = f"{table_name}_pending"
 
         conn.execute(
@@ -169,11 +140,169 @@ def delete_sqlite_tables(table_names):
     conn.commit()
 
 
+# =========================================================
+# LOGICAL DATA TYPE DETECTION
+# =========================================================
+
+def detect_column_type(series):
+    """
+    Reduce all data types to only three logical types:
+
+        Date
+        Number
+        Text
+
+    Empty or ambiguous data defaults to Text.
+    """
+
+    if series is None:
+        return "Text"
+
+    clean = series.dropna()
+
+    if clean.empty:
+        return "Text"
+
+    # ---------------------------------------------
+    # Already datetime
+    # ---------------------------------------------
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "Date"
+
+    # ---------------------------------------------
+    # Numeric
+    # ---------------------------------------------
+
+    numeric_test = pd.to_numeric(
+        clean,
+        errors="coerce"
+    )
+
+    if numeric_test.notna().all():
+        return "Number"
+
+    # ---------------------------------------------
+    # Date
+    # ---------------------------------------------
+
+    date_test = pd.to_datetime(
+        clean,
+        errors="coerce"
+    )
+
+    if date_test.notna().all():
+        return "Date"
+
+    # ---------------------------------------------
+    # Otherwise Text
+    # ---------------------------------------------
+
+    return "Text"
+
+
+def get_dataframe_types(df):
+    """
+    Return logical types for every dataframe column.
+    """
+
+    return {
+        column: detect_column_type(df[column])
+        for column in df.columns
+    }
+
+
+# =========================================================
+# NORMALIZATION
+# =========================================================
+
+def normalize_value(value, logical_type):
+
+    if pd.isna(value):
+        return None
+
+    # ---------------------------------------------
+    # DATE
+    # ---------------------------------------------
+
+    if logical_type == "Date":
+
+        parsed = pd.to_datetime(
+            value,
+            errors="coerce"
+        )
+
+        if pd.isna(parsed):
+            return None
+
+        return parsed.strftime("%Y-%m-%d")
+
+    # ---------------------------------------------
+    # NUMBER
+    # ---------------------------------------------
+
+    if logical_type == "Number":
+
+        number = pd.to_numeric(
+            value,
+            errors="coerce"
+        )
+
+        if pd.isna(number):
+            return None
+
+        number = float(number)
+
+        if number.is_integer():
+            return int(number)
+
+        return number
+
+    # ---------------------------------------------
+    # TEXT
+    # ---------------------------------------------
+
+    value = str(value).strip()
+
+    if value == "":
+        return None
+
+    return value
+
+
+def normalize_dataframe(df, column_types=None):
+    """
+    Normalize dataframe values according to the three
+    logical types.
+    """
+
+    df = df.copy()
+
+    if column_types is None:
+        column_types = get_dataframe_types(df)
+
+    for column in df.columns:
+
+        logical_type = column_types.get(
+            column,
+            "Text"
+        )
+
+        df[column] = df[column].apply(
+            lambda value: normalize_value(
+                value,
+                logical_type
+            )
+        )
+
+    return df
+
+
+# =========================================================
+# DATE NORMALIZATION
+# =========================================================
+
 def normalize_database_dates(df):
-    """
-    Normalize date columns read from SQLite so they can
-    be compared with prepared source data.
-    """
 
     df = df.copy()
 
@@ -197,12 +326,8 @@ def normalize_database_dates(df):
 # =========================================================
 
 def prepare_data(df):
-    """
-    Clean data and calculate derived fields.
-    """
 
     df = df.copy()
-
 
     # -----------------------------------------------------
     # HATCH DATE
@@ -215,7 +340,6 @@ def prepare_data(df):
             errors="coerce"
         )
 
-
     # -----------------------------------------------------
     # DEATH DATE
     # -----------------------------------------------------
@@ -226,7 +350,6 @@ def prepare_data(df):
             df["DEATH DATE"],
             errors="coerce"
         )
-
 
     # -----------------------------------------------------
     # RECORD MONTH
@@ -239,7 +362,6 @@ def prepare_data(df):
             .astype(str)
             .str.strip()
         )
-
 
     # -----------------------------------------------------
     # AGE IN MONTHS
@@ -276,7 +398,6 @@ def prepare_data(df):
             .clip(lower=0)
         )
 
-
     # -----------------------------------------------------
     # AGE CLASS
     # -----------------------------------------------------
@@ -302,18 +423,54 @@ def prepare_data(df):
             .apply(get_age_class)
         )
 
-
     return df
 
 
 # =========================================================
-# SCHEMA VALIDATION
+# LOGICAL SCHEMA VALIDATION
 # =========================================================
+
+def get_table_logical_types(table_name):
+
+    """
+    Detect the logical type of every column in an existing
+    SQLite table using its actual data.
+
+    Only:
+
+        Date
+        Number
+        Text
+
+    are considered.
+    """
+
+    table_df = pd.read_sql_query(
+        f'SELECT * FROM "{table_name}"',
+        conn
+    )
+
+    if table_df.empty:
+
+        return {
+            column: "Text"
+            for column in table_df.columns
+        }
+
+    return get_dataframe_types(
+        table_df
+    )
+
 
 def schema_matches(df, table_name):
     """
-    Check whether incoming data has exactly
-    the same columns as the production table.
+    Validate using:
+
+        1. Same column names
+        2. Same column order
+        3. Compatible logical types
+
+    Exact SQLite/Pandas types are ignored.
     """
 
     source_columns = list(df.columns)
@@ -322,7 +479,41 @@ def schema_matches(df, table_name):
         table_name
     )
 
-    return source_columns == database_columns
+    # -----------------------------------------------------
+    # COLUMN STRUCTURE
+    # -----------------------------------------------------
+
+    if source_columns != database_columns:
+        return False
+
+    # -----------------------------------------------------
+    # LOGICAL TYPES
+    # -----------------------------------------------------
+
+    source_types = get_dataframe_types(
+        df
+    )
+
+    database_types = get_table_logical_types(
+        table_name
+    )
+
+    for column in source_columns:
+
+        source_type = source_types.get(
+            column,
+            "Text"
+        )
+
+        database_type = database_types.get(
+            column,
+            "Text"
+        )
+
+        if source_type != database_type:
+            return False
+
+    return True
 
 
 # =========================================================
@@ -331,72 +522,85 @@ def schema_matches(df, table_name):
 
 def find_new_records(df, existing_df):
 
+    incoming = df.copy()
+    existing = existing_df.copy()
+
     # -----------------------------------------------------
-    # NORMALIZE DATE TYPES
+    # SAME COLUMNS
+    # -----------------------------------------------------
+
+    if not existing.empty:
+
+        existing = existing[
+            incoming.columns
+        ]
+
+    # -----------------------------------------------------
+    # DETERMINE LOGICAL TYPES
+    # -----------------------------------------------------
+
+    combined_for_types = pd.concat(
+        [
+            incoming,
+            existing
+        ],
+        ignore_index=True
+    )
+
+    column_types = get_dataframe_types(
+        combined_for_types
+    )
+
+    # -----------------------------------------------------
+    # NORMALIZE BOTH DATASETS
+    # -----------------------------------------------------
+
+    incoming = normalize_dataframe(
+        incoming,
+        column_types
+    )
+
+    existing = normalize_dataframe(
+        existing,
+        column_types
+    )
+
+    # -----------------------------------------------------
+    # REMOVE DUPLICATES INSIDE SOURCE
     # -----------------------------------------------------
 
     incoming_unique = (
-        df
+        incoming
         .drop_duplicates()
         .reset_index(drop=True)
     )
 
-    incoming_unique = normalize_database_dates(
-        incoming_unique
+    duplicate_count = (
+        len(df)
+        - len(incoming_unique)
     )
-
-    existing_unique = existing_df.copy()
-
-    existing_unique = normalize_database_dates(
-        existing_unique
-    )
-
 
     # -----------------------------------------------------
     # NO EXISTING RECORDS
     # -----------------------------------------------------
 
-    if existing_unique.empty:
-
-        duplicate_count = (
-            len(df)
-            - len(incoming_unique)
-        )
+    if existing.empty:
 
         return (
             incoming_unique,
             duplicate_count
         )
 
-
     # -----------------------------------------------------
-    # MAKE SURE WE COMPARE THE SAME COLUMNS
-    # -----------------------------------------------------
-
-    existing_unique = (
-        existing_unique[
-            incoming_unique.columns
-        ]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-
-
-    # -----------------------------------------------------
-    # COMPARE INCOMING RECORDS AGAINST SQLITE
+    # REMOVE DUPLICATES AGAINST DATABASE
     # -----------------------------------------------------
 
     comparison = incoming_unique.merge(
-        existing_unique,
+        existing.drop_duplicates(),
         how="left",
         on=list(incoming_unique.columns),
         indicator=True
     )
-
-
-    # -----------------------------------------------------
-    # KEEP ONLY NEW RECORDS
-    # -----------------------------------------------------
 
     new_df = (
         comparison[
@@ -406,16 +610,10 @@ def find_new_records(df, existing_df):
         .reset_index(drop=True)
     )
 
-
-    # -----------------------------------------------------
-    # DUPLICATE COUNT
-    # -----------------------------------------------------
-
-    duplicate_count = (
-        len(df)
+    duplicate_count += (
+        len(incoming_unique)
         - len(new_df)
     )
-
 
     return (
         new_df,
@@ -428,14 +626,6 @@ def find_new_records(df, existing_df):
 # =========================================================
 
 def import_source_data(df, table_name):
-    """
-    Create a production table if it does not exist.
-
-    If the table already exists:
-        - validate schema
-        - detect new records
-        - append only new records
-    """
 
     # -----------------------------------------------------
     # CREATE NEW TABLE
@@ -458,7 +648,6 @@ def import_source_data(df, table_name):
             "duplicates": 0
         }
 
-
     # -----------------------------------------------------
     # CHECK SCHEMA
     # -----------------------------------------------------
@@ -469,10 +658,9 @@ def import_source_data(df, table_name):
     ):
 
         raise ValueError(
-            "The source file does not match "
-            "the existing dataset structure."
+            "The source columns or logical data types "
+            "do not match the existing dataset."
         )
-
 
     # -----------------------------------------------------
     # READ EXISTING DATA
@@ -482,11 +670,6 @@ def import_source_data(df, table_name):
         f'SELECT * FROM "{table_name}"',
         conn
     )
-
-    existing_df = normalize_database_dates(
-        existing_df
-    )
-
 
     # -----------------------------------------------------
     # FIND NEW RECORDS
@@ -498,7 +681,6 @@ def import_source_data(df, table_name):
             existing_df
         )
     )
-
 
     # -----------------------------------------------------
     # APPEND NEW RECORDS
@@ -515,7 +697,6 @@ def import_source_data(df, table_name):
 
         conn.commit()
 
-
     return {
         "created": False,
         "added": len(new_df),
@@ -531,13 +712,6 @@ def create_pending_table(
     table_name,
     columns
 ):
-    """
-    Create:
-
-        <table_name>_pending
-
-    using the same columns as the production table.
-    """
 
     pending_table = (
         f"{table_name}_pending"
@@ -567,18 +741,10 @@ def add_pending_record(
     record_df,
     table_name
 ):
-    """
-    Add a new record to the pending table.
-
-    Reject exact duplicates already found in:
-        1. Production
-        2. Pending
-    """
 
     pending_table = (
         f"{table_name}_pending"
     )
-
 
     # -----------------------------------------------------
     # MAKE SURE PENDING TABLE EXISTS
@@ -589,9 +755,8 @@ def add_pending_record(
         list(record_df.columns)
     )
 
-
     # -----------------------------------------------------
-    # CHECK PRODUCTION
+    # READ PRODUCTION
     # -----------------------------------------------------
 
     production_df = pd.read_sql_query(
@@ -599,41 +764,50 @@ def add_pending_record(
         conn
     )
 
-    production_df = normalize_database_dates(
-        production_df
+    # -----------------------------------------------------
+    # NORMALIZE
+    # -----------------------------------------------------
+
+    combined_for_types = pd.concat(
+        [
+            production_df,
+            record_df
+        ],
+        ignore_index=True
     )
 
-    record_df = normalize_database_dates(
-        record_df
+    column_types = get_dataframe_types(
+        combined_for_types
     )
 
+    production_df = normalize_dataframe(
+        production_df,
+        column_types
+    )
+
+    record_df = normalize_dataframe(
+        record_df,
+        column_types
+    )
+
+    # -----------------------------------------------------
+    # CHECK PRODUCTION DUPLICATE
+    # -----------------------------------------------------
 
     if not production_df.empty:
 
-        production_df = (
-            production_df[
-                record_df.columns
-            ]
+        comparison = record_df.merge(
+            production_df.drop_duplicates(),
+            how="inner",
+            on=list(record_df.columns)
         )
 
-        combined = pd.concat(
-            [
-                production_df,
-                record_df
-            ],
-            ignore_index=True
-        )
-
-        if (
-            len(combined.drop_duplicates())
-            == len(production_df)
-        ):
+        if not comparison.empty:
 
             return False, "duplicate"
 
-
     # -----------------------------------------------------
-    # CHECK PENDING
+    # READ PENDING
     # -----------------------------------------------------
 
     pending_df = pd.read_sql_query(
@@ -641,28 +815,26 @@ def add_pending_record(
         conn
     )
 
-    pending_df = normalize_database_dates(
-        pending_df
+    pending_df = normalize_dataframe(
+        pending_df,
+        column_types
     )
 
+    # -----------------------------------------------------
+    # CHECK PENDING DUPLICATE
+    # -----------------------------------------------------
 
     if not pending_df.empty:
 
-        combined = pd.concat(
-            [
-                pending_df,
-                record_df
-            ],
-            ignore_index=True
+        comparison = record_df.merge(
+            pending_df.drop_duplicates(),
+            how="inner",
+            on=list(record_df.columns)
         )
 
-        if (
-            len(combined.drop_duplicates())
-            == len(pending_df)
-        ):
+        if not comparison.empty:
 
             return False, "pending_duplicate"
-
 
     # -----------------------------------------------------
     # ADD RECORD
@@ -684,9 +856,6 @@ def approve_pending_record(
     table_name,
     row_index
 ):
-    """
-    Move one pending record into production.
-    """
 
     pending_table = (
         f"{table_name}_pending"
@@ -706,7 +875,6 @@ def approve_pending_record(
     ):
         return False
 
-
     # -----------------------------------------------------
     # SELECT RECORD
     # -----------------------------------------------------
@@ -715,13 +883,8 @@ def approve_pending_record(
         [row_index]
     ].copy()
 
-    record = normalize_database_dates(
-        record
-    )
-
-
     # -----------------------------------------------------
-    # FINAL DUPLICATE CHECK
+    # PRODUCTION DATA
     # -----------------------------------------------------
 
     production_df = pd.read_sql_query(
@@ -729,9 +892,9 @@ def approve_pending_record(
         conn
     )
 
-    production_df = normalize_database_dates(
-        production_df
-    )
+    # -----------------------------------------------------
+    # FINAL DUPLICATE CHECK
+    # -----------------------------------------------------
 
     new_df, duplicate_count = (
         find_new_records(
@@ -740,10 +903,8 @@ def approve_pending_record(
         )
     )
 
-
     if duplicate_count > 0:
         return False
-
 
     # -----------------------------------------------------
     # APPEND TO PRODUCTION
@@ -755,7 +916,6 @@ def approve_pending_record(
         if_exists="append",
         index=False
     )
-
 
     # -----------------------------------------------------
     # REMOVE FROM PENDING
@@ -781,10 +941,6 @@ def reject_pending_record(
     table_name,
     row_index
 ):
-    """
-    Permanently remove one record from the pending table
-    without adding it to production.
-    """
 
     pending_table = (
         f"{table_name}_pending"
@@ -804,15 +960,13 @@ def reject_pending_record(
     ):
         return False
 
-
     # -----------------------------------------------------
-    # REMOVE SELECTED RECORD
+    # REMOVE RECORD
     # -----------------------------------------------------
 
     pending_df = pending_df.drop(
         pending_df.index[row_index]
     )
-
 
     # -----------------------------------------------------
     # REWRITE PENDING TABLE
@@ -828,6 +982,48 @@ def reject_pending_record(
     conn.commit()
 
     return True
+
+
+# =========================================================
+# DYNAMIC INPUT FIELD
+# =========================================================
+
+def create_input_field(
+    column,
+    logical_type,
+    key_prefix
+):
+    """
+    Create an input widget based on the logical type.
+
+    Date   -> date_input
+    Number -> number_input
+    Text   -> text_input
+    """
+
+    if logical_type == "Date":
+
+        return st.date_input(
+            column,
+            value=None,
+            key=f"{key_prefix}_{column}"
+        )
+
+    elif logical_type == "Number":
+
+        return st.number_input(
+            column,
+            value=0.0,
+            step=1.0,
+            key=f"{key_prefix}_{column}"
+        )
+
+    else:
+
+        return st.text_input(
+            column,
+            key=f"{key_prefix}_{column}"
+        )
 
 
 # =========================================================
@@ -856,7 +1052,6 @@ if page == "Admin":
 
     st.title("Admin")
 
-
     # =====================================================
     # 1. DETECT / IMPORT
     # =====================================================
@@ -870,11 +1065,6 @@ if page == "Admin":
             "Source Data"
         )
 
-
-        # -------------------------------------------------
-        # UPLOAD CSV
-        # -------------------------------------------------
-
         uploaded_files = st.file_uploader(
             "Upload CSV file(s)",
             type=["csv"],
@@ -882,19 +1072,9 @@ if page == "Admin":
             key="source_csv_upload"
         )
 
-
-        # -------------------------------------------------
-        # DETECT CSV FILES IN DATA FOLDER
-        # -------------------------------------------------
-
         local_files = sorted(
             DATA_FOLDER.glob("*.csv")
         )
-
-
-        # -------------------------------------------------
-        # SHOW DETECTION STATUS
-        # -------------------------------------------------
 
         if local_files:
 
@@ -910,15 +1090,7 @@ if page == "Admin":
                 "You can still upload CSV files above."
             )
 
-
-        # -------------------------------------------------
-        # COMBINE AVAILABLE SOURCES
-        # -------------------------------------------------
-
         source_options = []
-
-
-        # Local GitHub files
 
         for file in local_files:
 
@@ -929,9 +1101,6 @@ if page == "Admin":
                 )
             )
 
-
-        # Uploaded files
-
         for file in uploaded_files:
 
             source_options.append(
@@ -941,11 +1110,6 @@ if page == "Admin":
                 )
             )
 
-
-        # -------------------------------------------------
-        # NO SOURCES
-        # -------------------------------------------------
-
         if not source_options:
 
             st.warning(
@@ -953,21 +1117,11 @@ if page == "Admin":
                 "Upload a CSV file to begin."
             )
 
-
-        # -------------------------------------------------
-        # SOURCE AVAILABLE
-        # -------------------------------------------------
-
         else:
 
             st.write(
                 f"**{len(source_options)} source file(s) available.**"
             )
-
-
-            # -------------------------------------------------
-            # SOURCE FILE SELECTION
-            # -------------------------------------------------
 
             selected_source_label = st.selectbox(
                 "Select source file",
@@ -978,18 +1132,15 @@ if page == "Admin":
                 key="source_file"
             )
 
-
             selected_source = next(
                 item[1]
                 for item in source_options
                 if item[0] == selected_source_label
             )
 
-
             table_name = get_dataset_name(
                 selected_source
             )
-
 
             st.write(
                 f"**Source file:** "
@@ -1006,30 +1157,15 @@ if page == "Admin":
                 f"`{table_name}`"
             )
 
-
-            # -------------------------------------------------
-            # READ SOURCE FILE
-            # -------------------------------------------------
-
             try:
 
                 source_df = pd.read_csv(
                     selected_source
                 )
 
-
-                # ---------------------------------------------
-                # PREPARE DATA
-                # ---------------------------------------------
-
                 prepared_df = prepare_data(
                     source_df
                 )
-
-
-                # ---------------------------------------------
-                # PREVIEW
-                # ---------------------------------------------
 
                 st.write(
                     "**Source data preview**"
@@ -1040,10 +1176,34 @@ if page == "Admin":
                     use_container_width=True
                 )
 
+                # -------------------------------------------------
+                # DETECT LOGICAL TYPES
+                # -------------------------------------------------
 
-                # ---------------------------------------------
+                source_types = get_dataframe_types(
+                    prepared_df
+                )
+
+                with st.expander(
+                    "Detected Data Types"
+                ):
+
+                    type_df = pd.DataFrame(
+                        {
+                            "Column": source_types.keys(),
+                            "Type": source_types.values()
+                        }
+                    )
+
+                    st.dataframe(
+                        type_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                # -------------------------------------------------
                 # VALIDATION
-                # ---------------------------------------------
+                # -------------------------------------------------
 
                 if table_exists(
                     table_name
@@ -1059,20 +1219,12 @@ if page == "Admin":
                             "the existing SQLite dataset."
                         )
 
-
                         existing_df = (
                             pd.read_sql_query(
                                 f'SELECT * FROM "{table_name}"',
                                 conn
                             )
                         )
-
-                        existing_df = (
-                            normalize_database_dates(
-                                existing_df
-                            )
-                        )
-
 
                         new_df, duplicate_count = (
                             find_new_records(
@@ -1081,15 +1233,9 @@ if page == "Admin":
                             )
                         )
 
-
-                        # -------------------------------------
-                        # SUMMARY METRICS
-                        # -------------------------------------
-
                         col1, col2, col3 = (
                             st.columns(3)
                         )
-
 
                         with col1:
 
@@ -1098,7 +1244,6 @@ if page == "Admin":
                                 f"{len(existing_df):,}"
                             )
 
-
                         with col2:
 
                             st.metric(
@@ -1106,18 +1251,12 @@ if page == "Admin":
                                 f"{len(new_df):,}"
                             )
 
-
                         with col3:
 
                             st.metric(
                                 "Duplicate Records",
                                 f"{duplicate_count:,}"
                             )
-
-
-                        # -------------------------------------
-                        # IMPORT
-                        # -------------------------------------
 
                         if st.button(
                             "Import / Sync Source Data",
@@ -1133,7 +1272,6 @@ if page == "Admin":
                                         table_name
                                     )
                                 )
-
 
                                 if result["created"]:
 
@@ -1158,16 +1296,13 @@ if page == "Admin":
                                         f"duplicate record(s) skipped."
                                     )
 
-
                                 st.rerun()
-
 
                             except Exception as e:
 
                                 st.error(
                                     f"Import failed: {e}"
                                 )
-
 
                     else:
 
@@ -1176,6 +1311,10 @@ if page == "Admin":
                             "the existing SQLite dataset."
                         )
 
+                        st.write(
+                            "The column names/order and logical "
+                            "types must match."
+                        )
 
                 else:
 
@@ -1183,7 +1322,6 @@ if page == "Admin":
                         f"SQLite table `{table_name}` "
                         f"does not exist yet."
                     )
-
 
                     if st.button(
                         "Create SQLite Table",
@@ -1200,7 +1338,6 @@ if page == "Admin":
                                 )
                             )
 
-
                             st.success(
                                 f"SQLite table "
                                 f"`{table_name}` created "
@@ -1211,20 +1348,17 @@ if page == "Admin":
 
                             st.rerun()
 
-
                         except Exception as e:
 
                             st.error(
                                 f"Import failed: {e}"
                             )
 
-
             except Exception as e:
 
                 st.error(
                     f"Could not read the source file: {e}"
                 )
-
 
     # =====================================================
     # 2. APPROVE / REJECT
@@ -1237,13 +1371,11 @@ if page == "Admin":
 
         tables = get_sqlite_tables()
 
-
         if not tables:
 
             st.info(
                 "No SQLite production tables exist yet."
             )
-
 
         else:
 
@@ -1253,11 +1385,9 @@ if page == "Admin":
                 key="pending_target"
             )
 
-
             pending_table = (
                 f"{pending_target}_pending"
             )
-
 
             if table_exists(
                 pending_table
@@ -1268,13 +1398,11 @@ if page == "Admin":
                     conn
                 )
 
-
                 if pending_df.empty:
 
                     st.info(
                         "No pending records."
                     )
-
 
                 else:
 
@@ -1283,12 +1411,10 @@ if page == "Admin":
                         f"**{len(pending_df):,}**"
                     )
 
-
                     st.dataframe(
                         pending_df,
                         use_container_width=True
                     )
-
 
                     selected_index = (
                         st.number_input(
@@ -1300,13 +1426,7 @@ if page == "Admin":
                         )
                     )
 
-
                     col1, col2 = st.columns(2)
-
-
-                    # -----------------------------------------
-                    # APPROVE
-                    # -----------------------------------------
 
                     with col1:
 
@@ -1323,7 +1443,6 @@ if page == "Admin":
                                 )
                             )
 
-
                             if success:
 
                                 st.success(
@@ -1333,18 +1452,12 @@ if page == "Admin":
 
                                 st.rerun()
 
-
                             else:
 
                                 st.warning(
                                     "Record could not be approved. "
                                     "It may already exist."
                                 )
-
-
-                    # -----------------------------------------
-                    # REJECT
-                    # -----------------------------------------
 
                     with col2:
 
@@ -1360,7 +1473,6 @@ if page == "Admin":
                                 )
                             )
 
-
                             if success:
 
                                 st.success(
@@ -1370,20 +1482,17 @@ if page == "Admin":
 
                                 st.rerun()
 
-
                             else:
 
                                 st.warning(
                                     "Record could not be rejected."
                                 )
 
-
             else:
 
                 st.info(
                     "No pending records for this dataset."
                 )
-
 
     # =====================================================
     # 3. DELETE / EXPORT
@@ -1396,24 +1505,17 @@ if page == "Admin":
 
         tables = get_sqlite_tables()
 
-
         if not tables:
 
             st.info(
                 "No SQLite tables are available."
             )
 
-
         else:
-
-            # -------------------------------------------------
-            # EXPORT
-            # -------------------------------------------------
 
             st.write(
                 "### Export"
             )
-
 
             export_table = st.selectbox(
                 "Select dataset to export",
@@ -1421,12 +1523,10 @@ if page == "Admin":
                 key="export_table"
             )
 
-
             export_df = pd.read_sql_query(
                 f'SELECT * FROM "{export_table}"',
                 conn
             )
-
 
             csv_data = (
                 export_df
@@ -1434,12 +1534,10 @@ if page == "Admin":
                 .encode("utf-8")
             )
 
-
             st.write(
                 f"Records: "
                 f"**{len(export_df):,}**"
             )
-
 
             st.download_button(
                 label="Export Table as CSV",
@@ -1448,25 +1546,17 @@ if page == "Admin":
                 mime="text/csv"
             )
 
-
             st.divider()
-
-
-            # -------------------------------------------------
-            # DELETE
-            # -------------------------------------------------
 
             st.write(
                 "### Delete SQLite Tables"
             )
-
 
             delete_tables = st.multiselect(
                 "Select SQLite table(s) to delete",
                 tables,
                 key="delete_tables"
             )
-
 
             if delete_tables:
 
@@ -1475,7 +1565,6 @@ if page == "Admin":
                     "records will be permanently deleted."
                 )
 
-
                 st.write(
                     "**Selected tables:** "
                     + ", ".join(
@@ -1483,7 +1572,6 @@ if page == "Admin":
                         for table in delete_tables
                     )
                 )
-
 
                 if st.button(
                     "Delete Selected SQLite Tables",
@@ -1495,11 +1583,6 @@ if page == "Admin":
                         "confirm_delete_tables"
                     ] = True
 
-
-            # -------------------------------------------------
-            # DELETE CONFIRMATION
-            # -------------------------------------------------
-
             if st.session_state.get(
                 "confirm_delete_tables",
                 False
@@ -1510,11 +1593,9 @@ if page == "Admin":
                     "delete the selected SQLite tables?"
                 )
 
-
                 confirm_col, cancel_col = (
                     st.columns(2)
                 )
-
 
                 with confirm_col:
 
@@ -1530,27 +1611,22 @@ if page == "Admin":
                                 delete_tables
                             )
 
-
                             st.session_state[
                                 "confirm_delete_tables"
                             ] = False
-
 
                             st.success(
                                 "Selected SQLite table(s) "
                                 "deleted successfully."
                             )
 
-
                             st.rerun()
-
 
                         except Exception as e:
 
                             st.error(
                                 f"Delete failed: {e}"
                             )
-
 
                 with cancel_col:
 
@@ -1574,11 +1650,9 @@ elif page == "Update Records":
 
     st.title("Update Records")
 
-
     sqlite_tables = (
         get_sqlite_tables()
     )
-
 
     if not sqlite_tables:
 
@@ -1586,7 +1660,6 @@ elif page == "Update Records":
             "No SQLite tables available. "
             "Import source data first."
         )
-
 
     else:
 
@@ -1596,64 +1669,97 @@ elif page == "Update Records":
             key="new_data_table"
         )
 
-
         st.write(
             f"**Enter new record for:** "
             f"`{selected_table}`"
         )
 
+        # -------------------------------------------------
+        # GET TABLE STRUCTURE
+        # -------------------------------------------------
+
+        table_columns = (
+            get_table_columns(
+                selected_table
+            )
+        )
+
+        # -------------------------------------------------
+        # DETECT TYPES FROM DATABASE
+        # -------------------------------------------------
+
+        table_df = pd.read_sql_query(
+            f'SELECT * FROM "{selected_table}"',
+            conn
+        )
+
+        table_types = get_dataframe_types(
+            table_df
+        )
+
+        # -------------------------------------------------
+        # SHOW DETECTED TYPES
+        # -------------------------------------------------
+
+        with st.expander(
+            "Detected Data Types",
+            expanded=False
+        ):
+
+            type_df = pd.DataFrame(
+                {
+                    "Column": table_columns,
+                    "Type": [
+                        table_types.get(
+                            column,
+                            "Text"
+                        )
+                        for column in table_columns
+                    ]
+                }
+            )
+
+            st.dataframe(
+                type_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # -------------------------------------------------
+        # FORM
+        # -------------------------------------------------
 
         with st.form(
             "new_data_form"
         ):
 
-            hatch_date = st.date_input(
-                "HATCH DATE"
-            )
+            entered_values = {}
 
+            for column in table_columns:
 
-            death_date = st.date_input(
-                "DEATH DATE"
-            )
+                # -----------------------------------------
+                # DERIVED FIELDS
+                # -----------------------------------------
 
+                if column in [
+                    "AGE IN MONTHS",
+                    "AGE CLASS"
+                ]:
 
-            record_month = st.selectbox(
-                "RECORD MONTH",
-                MONTHS
-            )
+                    continue
 
+                logical_type = table_types.get(
+                    column,
+                    "Text"
+                )
 
-            gender = st.text_input(
-                "GENDER"
-            )
-
-
-            wingband = st.text_input(
-                "APEX WINGBAND"
-            )
-
-
-            legband = st.text_input(
-                "APEX LEGBAND"
-            )
-
-
-            markings = st.text_input(
-                "MARKINGS"
-            )
-
-
-            area = st.text_input(
-                "AREA"
-            )
-
-
-            count = st.number_input(
-                "COUNT",
-                min_value=0,
-                step=1
-            )
-
+                entered_values[column] = (
+                    create_input_field(
+                        column,
+                        logical_type,
+                        "new_record"
+                    )
+                )
 
             submitted = (
                 st.form_submit_button(
@@ -1661,62 +1767,56 @@ elif page == "Update Records":
                 )
             )
 
+        # -------------------------------------------------
+        # SUBMIT
+        # -------------------------------------------------
 
         if submitted:
 
             record_df = pd.DataFrame(
-                [
-                    {
-                        "HATCH DATE": hatch_date,
-                        "DEATH DATE": death_date,
-                        "RECORD MONTH": record_month,
-                        "GENDER": gender,
-                        "APEX WINGBAND": wingband,
-                        "APEX LEGBAND": legband,
-                        "MARKINGS": markings,
-                        "AREA": area,
-                        "COUNT": count
-                    }
-                ]
+                [entered_values]
             )
 
-
             # ---------------------------------------------
-            # CALCULATE DERIVED FIELDS
+            # PREPARE DATA
             # ---------------------------------------------
 
             record_df = prepare_data(
                 record_df
             )
 
+            # ---------------------------------------------
+            # ADD ANY DERIVED COLUMNS
+            # ---------------------------------------------
+
+            for column in table_columns:
+
+                if column not in record_df.columns:
+
+                    record_df[column] = None
 
             # ---------------------------------------------
-            # MATCH TABLE STRUCTURE
+            # MATCH TABLE COLUMN ORDER
             # ---------------------------------------------
 
-            table_columns = (
-                get_table_columns(
-                    selected_table
-                )
+            record_df = record_df[
+                table_columns
+            ]
+
+            # ---------------------------------------------
+            # NORMALIZE
+            # ---------------------------------------------
+
+            record_df = normalize_dataframe(
+                record_df,
+                table_types
             )
 
+            # ---------------------------------------------
+            # ADD TO PENDING
+            # ---------------------------------------------
 
             try:
-
-                record_df = record_df[
-                    table_columns
-                ]
-
-
-            except KeyError:
-
-                st.error(
-                    "The standard input fields do not "
-                    "match the selected dataset."
-                )
-
-
-            else:
 
                 added, status = (
                     add_pending_record(
@@ -1725,13 +1825,11 @@ elif page == "Update Records":
                     )
                 )
 
-
                 if added:
 
                     st.success(
                         "Record submitted for review."
                     )
-
 
                 elif status == "duplicate":
 
@@ -1740,13 +1838,18 @@ elif page == "Update Records":
                         "in the production database."
                     )
 
-
                 elif status == "pending_duplicate":
 
                     st.warning(
                         "This record is already "
                         "pending review."
                     )
+
+            except Exception as e:
+
+                st.error(
+                    f"Could not submit record: {e}"
+                )
 
 
 # =========================================================
@@ -1757,11 +1860,6 @@ elif page == "Reports":
 
     st.title("Reports")
 
-
-    # =====================================================
-    # BASIC SUMMARY
-    # =====================================================
-
     with st.expander(
         "Basic Summary",
         expanded=True
@@ -1771,14 +1869,12 @@ elif page == "Reports":
             get_sqlite_tables()
         )
 
-
         if not tables:
 
             st.info(
                 "No SQLite tables available "
                 "for reporting."
             )
-
 
         else:
 
@@ -1788,18 +1884,15 @@ elif page == "Reports":
                 key="report_table"
             )
 
-
             report_df = pd.read_sql_query(
                 f'SELECT * FROM "{selected_report_table}"',
                 conn
             )
 
-
             st.write(
                 f"### Summary — "
                 f"`{selected_report_table}`"
             )
-
 
             # -------------------------------------------------
             # TOP SUMMARY METRICS
@@ -1809,14 +1902,12 @@ elif page == "Reports":
                 st.columns(3)
             )
 
-
             with col1:
 
                 st.metric(
                     "Total Records",
                     f"{len(report_df):,}"
                 )
-
 
             with col2:
 
@@ -1831,12 +1922,10 @@ elif page == "Reports":
 
                     total_count = 0
 
-
                 st.metric(
                     "Total Count",
                     f"{total_count:,.0f}"
                 )
-
 
             with col3:
 
@@ -1852,12 +1941,10 @@ elif page == "Reports":
 
                     areas = 0
 
-
                 st.metric(
                     "Areas",
                     f"{areas:,}"
                 )
-
 
             # -------------------------------------------------
             # GENDER SUMMARY
@@ -1868,7 +1955,6 @@ elif page == "Reports":
                 st.write(
                     "#### Gender"
                 )
-
 
                 gender_summary = (
                     report_df[
@@ -1883,13 +1969,11 @@ elif page == "Reports":
                     )
                 )
 
-
                 st.dataframe(
                     gender_summary,
                     use_container_width=True,
                     hide_index=True
                 )
-
 
             # -------------------------------------------------
             # AGE CLASS SUMMARY
@@ -1900,7 +1984,6 @@ elif page == "Reports":
                 st.write(
                     "#### Age Class"
                 )
-
 
                 age_summary = (
                     report_df[
@@ -1914,13 +1997,11 @@ elif page == "Reports":
                     )
                 )
 
-
                 st.dataframe(
                     age_summary,
                     use_container_width=True,
                     hide_index=True
                 )
-
 
             # -------------------------------------------------
             # RECORD MONTH SUMMARY
@@ -1931,7 +2012,6 @@ elif page == "Reports":
                 st.write(
                     "#### Record Month"
                 )
-
 
                 month_summary = (
                     report_df[
@@ -1950,13 +2030,11 @@ elif page == "Reports":
                     )
                 )
 
-
                 st.dataframe(
                     month_summary,
                     use_container_width=True,
                     hide_index=True
                 )
-
 
             # -------------------------------------------------
             # AREA SUMMARY
@@ -1967,7 +2045,6 @@ elif page == "Reports":
                 st.write(
                     "#### Area"
                 )
-
 
                 area_summary = (
                     report_df[
@@ -1981,7 +2058,6 @@ elif page == "Reports":
                         name="RECORDS"
                     )
                 )
-
 
                 st.dataframe(
                     area_summary,
